@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Cognitive Load Tracking</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 30px;
+        }
+
+        video {
+            display: block;
+            margin-bottom: 20px;
+        }
+
+        .box, .quiz-box {
+            padding: 15px;
+            border: 1px solid #ccc;
+            width: 600px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .label {
+            font-weight: bold;
+        }
+
+        .option {
+            margin: 8px 0;
+        }
+
+        button {
+            padding: 8px 14px;
+            margin-top: 8px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Video-Based Cognitive Load Tracking</h2>
+
+    <video id="video" width="600" controls>
+        <source src="sample.mp4" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+
+    <div class="box">
+        <p><span class="label">Pause Count:</span> <span id="pauseCount">0</span></p>
+        <p><span class="label">Seek Count:</span> <span id="seekCount">0</span></p>
+        <p><span class="label">Rewatch Count:</span> <span id="rewatchCount">0</span></p>
+        <p><span class="label">Playback Rate Changes:</span> <span id="rateChangeCount">0</span></p>
+        <p><span class="label">Idle Duration (sec):</span> <span id="idleDuration">0</span></p>
+        <p><span class="label">Quiz Response Time (sec):</span> <span id="quizTime">0</span></p>
+        <p><span class="label">Error Rate:</span> <span id="errorRate">0</span></p>
+        <p><span class="label">Prediction:</span> <span id="predictionResult">Waiting...</span></p>
+    </div>
+
+    <div class="quiz-box">
+        <h3>Quiz</h3>
+        <p>What is the main organelle responsible for photosynthesis?</p>
+
+        <div class="option">
+            <input type="radio" name="quiz" value="Mitochondria" id="opt1">
+            <label for="opt1">Mitochondria</label>
+        </div>
+
+        <div class="option">
+            <input type="radio" name="quiz" value="Chloroplast" id="opt2">
+            <label for="opt2">Chloroplast</label>
+        </div>
+
+        <div class="option">
+            <input type="radio" name="quiz" value="Nucleus" id="opt3">
+            <label for="opt3">Nucleus</label>
+        </div>
+
+        <div class="option">
+            <input type="radio" name="quiz" value="Ribosome" id="opt4">
+            <label for="opt4">Ribosome</label>
+        </div>
+
+        <button id="submitQuizBtn">Submit Quiz</button>
+        <p><span class="label">Quiz Status:</span> <span id="quizStatus">Not answered</span></p>
+    </div>
+    
+    <script>
+        const video = document.getElementById("video");
+
+        let pauseCount = 0;
+        let seekCount = 0;
+        let rewatchCount = 0;
+        let rateChangeCount = 0;
+        let idleDuration = 0;
+
+        let lastVideoTime = 0;
+        let idleStart = null;
+        let lastInteractionTime = Date.now();
+        let isSeeking = false;
+        let seekStartTime = 0;
+        let lastSeekEventTime = 0;
+        let lastRewatchEventTime = 0;
+        let lastPlaybackRate = video.playbackRate;
+        let suppressPauseCountUntil = 0;
+        let pauseConfirmTimeoutId = null;
+
+        // Required by the /predict schema.
+        const studentId = "S001";
+        const lessonId = "L101";
+
+        // Quiz variables
+        let quizStartTime = Date.now();
+        let quizResponseTime = 0;
+        let totalQuizAttempts = 0;
+        let totalQuizErrors = 0;
+
+        const pauseCountEl = document.getElementById("pauseCount");
+        const seekCountEl = document.getElementById("seekCount");
+        const rewatchCountEl = document.getElementById("rewatchCount");
+        const rateChangeCountEl = document.getElementById("rateChangeCount");
+        const idleDurationEl = document.getElementById("idleDuration");
+        const predictionResultEl = document.getElementById("predictionResult");
+
+        const quizTimeEl = document.getElementById("quizTime");
+        const errorRateEl = document.getElementById("errorRate");
+        const submitQuizBtn = document.getElementById("submitQuizBtn");
+        const quizStatusEl = document.getElementById("quizStatus");
+
+        function updateUI() {
+            pauseCountEl.textContent = pauseCount;
+            seekCountEl.textContent = seekCount;
+            rewatchCountEl.textContent = rewatchCount;
+            rateChangeCountEl.textContent = rateChangeCount;
+            idleDurationEl.textContent = idleDuration;
+            quizTimeEl.textContent = quizResponseTime;
+            errorRateEl.textContent = totalQuizAttempts > 0
+                ? (totalQuizErrors / totalQuizAttempts).toFixed(2)
+                : "0";
+        }
+
+        function markInteraction() {
+            lastInteractionTime = Date.now();
+            idleStart = null;
+        }
+
+        function isPauseFromSeek() {
+            const SEEK_PAUSE_GRACE_MS = 600;
+            const REWATCH_PAUSE_GRACE_MS = 3000;
+            const recentlySought = Date.now() - lastSeekEventTime < SEEK_PAUSE_GRACE_MS;
+            const recentlyRewatched = Date.now() - lastRewatchEventTime < REWATCH_PAUSE_GRACE_MS;
+            const inSuppressionWindow = Date.now() < suppressPauseCountUntil;
+            return isSeeking || video.seeking || recentlySought || recentlyRewatched || inSuppressionWindow;
+        }
+
+        // Detect seek start
+        video.addEventListener("seeking", () => {
+            isSeeking = true;
+            seekStartTime = lastVideoTime;
+            lastSeekEventTime = Date.now();
+            suppressPauseCountUntil = Date.now() + 2000;
+            markInteraction();
+        });
+
+        // Pause tracking
+        video.addEventListener("pause", () => {
+            const pausePosition = video.currentTime;
+
+            if (pauseConfirmTimeoutId) {
+                clearTimeout(pauseConfirmTimeoutId);
+            }
+
+            // Confirm after a short delay so seek/rewatch transient pauses are ignored.
+            pauseConfirmTimeoutId = setTimeout(() => {
+                const positionChanged = Math.abs(video.currentTime - pausePosition) > 0.15;
+
+                if (video.paused && !isPauseFromSeek() && !positionChanged) {
+                    pauseCount++;
+                    console.log("Pause count:", pauseCount);
+                    updateUI();
+                }
+
+                pauseConfirmTimeoutId = null;
+            }, 350);
+
+            markInteraction();
+        });
+
+        // Play tracking
+        video.addEventListener("play", () => {
+            if (pauseConfirmTimeoutId) {
+                clearTimeout(pauseConfirmTimeoutId);
+                pauseConfirmTimeoutId = null;
+            }
+            markInteraction();
+        });
+
+        // Seek tracking
+        video.addEventListener("seeked", () => {
+            lastSeekEventTime = Date.now();
+            suppressPauseCountUntil = Date.now() + 2000;
+
+            if (pauseConfirmTimeoutId) {
+                clearTimeout(pauseConfirmTimeoutId);
+                pauseConfirmTimeoutId = null;
+            }
+
+            // If user moved backward, count as rewatch
+            const isBackwardSeek = video.currentTime < seekStartTime - 0.25;
+
+            if (isBackwardSeek) {
+                rewatchCount++;
+                lastRewatchEventTime = Date.now();
+                suppressPauseCountUntil = Date.now() + 2500;
+                console.log("Rewatch count:", rewatchCount);
+            } else {
+                seekCount++;
+                console.log("Seek count:", seekCount);
+            }
+
+            updateUI();
+            markInteraction();
+
+            // Reset seek flag after pause/play events settle.
+            setTimeout(() => {
+                isSeeking = false;
+            }, 0);
+        });
+
+        // Playback rate change tracking
+        video.addEventListener("ratechange", () => {
+            const currentRate = video.playbackRate;
+
+            // Some browsers fire duplicate ratechange events for one user action.
+            if (currentRate === lastPlaybackRate) {
+                return;
+            }
+
+            lastPlaybackRate = currentRate;
+            rateChangeCount++;
+            markInteraction();
+            updateUI();
+            console.log("Playback rate changed:", rateChangeCount);
+        });
+
+        // Track current time
+        video.addEventListener("timeupdate", () => {
+            lastVideoTime = video.currentTime;
+        });
+
+        // Detect general user interaction
+        document.addEventListener("mousemove", markInteraction);
+        document.addEventListener("keydown", markInteraction);
+        document.addEventListener("click", markInteraction);
+
+        // Idle detection check every second
+        setInterval(() => {
+            const now = Date.now();
+            const inactiveMs = now - lastInteractionTime;
+
+            // If inactive for more than 60 seconds, start counting idle time
+            if (inactiveMs > 60000) {
+                if (!idleStart) {
+                    idleStart = now;
+                } else {
+                    idleDuration += 1;
+                    updateUI();
+                }
+            }
+        }, 1000);
+
+        // Quiz submit logic
+        submitQuizBtn.addEventListener("click", () => {
+            const selected = document.querySelector('input[name="quiz"]:checked');
+
+            if (!selected) {
+                quizStatusEl.textContent = "Please select an answer";
+                return;
+            }
+
+            totalQuizAttempts++;
+            quizResponseTime = Math.round((Date.now() - quizStartTime) / 1000);
+
+            const correctAnswer = "Chloroplast";
+
+            if (selected.value !== correctAnswer) {
+                totalQuizErrors++;
+                quizStatusEl.textContent = "Incorrect";
+            } else {
+                quizStatusEl.textContent = "Correct";
+            }
+
+            updateUI();
+            markInteraction();
+        });
+
+        // Send data every 2 minutes
+        setInterval(() => {
+            const errorRate = totalQuizAttempts > 0
+                ? totalQuizErrors / totalQuizAttempts
+                : 0;
+
+            const data = {
+                student_id: studentId,
+                lesson_id: lessonId,
+                pause_frequency: pauseCount,
+                navigation_count_video: seekCount,
+                rewatch_segments: rewatchCount,
+                playback_rate_change: rateChangeCount,
+                idle_duration_video: idleDuration,
+                time_on_content: 120 - idleDuration > 0 ? 120 - idleDuration : 0,
+                navigation_count_adaptation: 0,
+                revisit_frequency: 0,
+                idle_duration_adaptation: 0,
+                quiz_response_time: quizResponseTime,
+                error_rate: errorRate
+            };
+
+            console.log("Sending data to API:", data);
+
+            fetch("http://127.0.0.1:8000/predict", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(data)
+            })
+            .then(async response => {
+                const payload = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(payload?.detail ? JSON.stringify(payload.detail) : "Request failed");
+                }
+
+                return payload;
+            })
+            .then(result => {
+                console.log("Prediction result:", result);
+                predictionResultEl.textContent =
+                    `${result.predicted_label} (Score: ${result.predicted_score}, Confidence: ${result.confidence})`;
+            })
+            .catch(error => {
+                console.error("API error:", error);
+                predictionResultEl.textContent = "API error";
+            });
+
+            // Reset counters for next 2-minute window
+            pauseCount = 0;
+            seekCount = 0;
+            rewatchCount = 0;
+            rateChangeCount = 0;
+            idleDuration = 0;
+            isSeeking = false;
+            quizResponseTime = 0;
+            quizStartTime = Date.now();
+            updateUI();
+
+        }, 120000); // 2 minutes
+    </script>
+
+</body>
+</html>
